@@ -11,11 +11,15 @@ name = "zero2prod"
 
 [dependencies]
 actix-web = "4"
+chrono = { version = "0.4.22", default-features = false, features = ["clock"] }
 config = "0.14"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = { version = "0.1", features = ["log"] }
+tracing-bunyan-formatter = "0.3"
+tracing-log = "0.2"
+tracing-subscriber = { version = "0.3", features = ["registry", "env-filter"] }
 uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4.22", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 reqwest = "0.12"
