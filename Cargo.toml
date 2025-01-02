@@ -32,6 +32,9 @@ fake = "2.9"
 quickcheck = "1.0.3"
 quickcheck_macros = "1"
 rand = "0.8"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt"] }
+wiremock = "0.6"
 
 [dependencies.reqwest]
 version = "0.12"
