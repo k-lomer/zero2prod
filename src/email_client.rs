@@ -59,7 +59,7 @@ impl EmailClient {
         Ok(())
     }
 
-    fn build_url(&self) -> Result<reqwest::Url, String> {
+    pub fn build_url(&self) -> Result<reqwest::Url, String> {
         reqwest::Url::parse(&self.base_url)
             .map_err(|e| e.to_string())?
             .join("email")
@@ -202,5 +202,11 @@ mod tests {
             .await;
 
         assert_err!(outcome);
+    }
+
+    #[test]
+    fn build_url_works_with_local_host() {
+        let email_client = email_client("http://localhost".to_string());
+        assert!(email_client.build_url().is_ok());
     }
 }

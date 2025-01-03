@@ -5,7 +5,7 @@ application:
 database:
   require_ssl: false
 email_client:
-  base_url: "localhost"
+  base_url: "http://localhost:80"
   sender_email: "test@gmail.com"
   authorization_token: "dummy-secret-token"
 
