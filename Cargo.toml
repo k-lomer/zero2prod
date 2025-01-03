@@ -29,6 +29,7 @@ validator = "0.19"
 [dev-dependencies]
 claims = "0.7"
 fake = "2.9"
+linkify = "0.10"
 quickcheck = "1.0.3"
 quickcheck_macros = "1"
 rand = "0.8"
