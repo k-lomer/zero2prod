@@ -2,12 +2,10 @@
 
 use actix_web::{web, HttpResponse};
 use chrono::Utc;
-use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
 use sqlx::{Executor, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::domain::{NewSubscriber, SubscriberEmail, SubscriberName};
+use crate::domain::{NewSubscriber, SubscriberEmail, SubscriberName, SubscriptionToken};
 use crate::email_client::EmailClient;
 use crate::startup::ApplicationBaseUrl;
 
@@ -75,7 +73,7 @@ pub async fn subscribe(
             subscriber_id = Some(new_subscriber_id);
         }
 
-        let new_subscription_token = generate_subscription_token();
+        let new_subscription_token = SubscriptionToken::generate();
         if let Some(subscriber_id) = subscriber_id {
             if store_token(&mut transaction, subscriber_id, &new_subscription_token)
                 .await
@@ -145,14 +143,14 @@ pub async fn insert_subscriber(
 pub async fn store_token(
     transaction: &mut Transaction<'_, Postgres>,
     subscriber_id: Uuid,
-    subscription_token: &str,
+    subscription_token: &SubscriptionToken,
 ) -> Result<(), sqlx::Error> {
     let query = sqlx::query!(
         r#"
         INSERT INTO subscription_tokens (subscription_token, subscriber_id)
         VALUES ($1, $2)
         "#,
-        subscription_token,
+        subscription_token.as_ref(),
         subscriber_id
     );
     transaction.execute(query).await.map_err(|e| {
@@ -170,11 +168,12 @@ pub async fn send_confirmation_email(
     email_client: &EmailClient,
     new_subscriber: NewSubscriber,
     base_url: &str,
-    subscription_token: &str,
+    subscription_token: &SubscriptionToken,
 ) -> Result<(), String> {
     let confirmation_link = format!(
         "{}/subscriptions/confirm?subscription_token={}",
-        base_url, subscription_token,
+        base_url,
+        subscription_token.as_ref(),
     );
     let plain_body = format!(
         "Welcome to our newsletter!\nVisit {} to confirm your subscription.",
@@ -190,19 +189,11 @@ pub async fn send_confirmation_email(
         .await
 }
 
-fn generate_subscription_token() -> String {
-    let mut rng = thread_rng();
-    std::iter::repeat_with(|| rng.sample(Alphanumeric))
-        .map(char::from)
-        .take(25)
-        .collect()
-}
-
 #[tracing::instrument(name = "Get subscription token from id", skip(pool, subscriber_id))]
 pub async fn get_subscription_token_from_id(
     pool: &PgPool,
     subscriber_id: &Uuid,
-) -> Result<Option<String>, sqlx::Error> {
+) -> Result<Option<SubscriptionToken>, String> {
     let result = sqlx::query!(
         "SELECT subscription_token FROM subscription_tokens \
         WHERE subscriber_id = $1",
@@ -212,9 +203,11 @@ pub async fn get_subscription_token_from_id(
     .await
     .map_err(|e| {
         tracing::error!("Failed to execute query: {:?}", e);
-        e
+        e.to_string()
     })?;
-    Ok(result.map(|r| r.subscription_token))
+    result.map_or(Ok(None), |record| {
+        SubscriptionToken::parse(record.subscription_token).map(Some)
+    })
 }
 
 #[tracing::instrument(name = "Get subscriber id from email", skip(pool, subscriber))]
