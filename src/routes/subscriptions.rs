@@ -47,37 +47,65 @@ pub async fn subscribe(
         Err(_) => return HttpResponse::BadRequest().finish(),
     };
 
-    let mut transaction = match pool.begin().await {
-        Ok(transaction) => transaction,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
-    };
-
-    let subscriber_id = match insert_subscriber(&new_subscriber, &mut transaction).await {
+    let mut subscriber_id = match get_subscriber_id_from_email(&pool, &new_subscriber).await {
         Ok(subscriber_id) => subscriber_id,
         Err(_) => return HttpResponse::InternalServerError().finish(),
     };
 
-    let subscription_token = generate_subscription_token();
-    if store_token(&mut transaction, subscriber_id, &subscription_token)
+    let mut subscription_token = match subscriber_id {
+        Some(subscriber_id) => match get_subscription_token_from_id(&pool, &subscriber_id).await {
+            Ok(subscription_token) => subscription_token,
+            Err(_) => return HttpResponse::InternalServerError().finish(),
+        },
+        None => None,
+    };
+
+    if subscription_token.is_none() {
+        let mut transaction = match pool.begin().await {
+            Ok(transaction) => transaction,
+            Err(_) => return HttpResponse::InternalServerError().finish(),
+        };
+
+        if subscriber_id.is_none() {
+            let new_subscriber_id = match insert_subscriber(&new_subscriber, &mut transaction).await
+            {
+                Ok(new_subscriber_id) => new_subscriber_id,
+                Err(_) => return HttpResponse::InternalServerError().finish(),
+            };
+            subscriber_id = Some(new_subscriber_id);
+        }
+
+        let new_subscription_token = generate_subscription_token();
+        if let Some(subscriber_id) = subscriber_id {
+            if store_token(&mut transaction, subscriber_id, &new_subscription_token)
+                .await
+                .is_err()
+            {
+                return HttpResponse::InternalServerError().finish();
+            }
+            subscription_token = Some(new_subscription_token);
+        } else {
+            return HttpResponse::InternalServerError().finish();
+        }
+
+        if transaction.commit().await.is_err() {
+            return HttpResponse::InternalServerError().finish();
+        }
+    }
+
+    if let Some(subscription_token) = subscription_token {
+        if send_confirmation_email(
+            &email_client,
+            new_subscriber,
+            &base_url.0,
+            &subscription_token,
+        )
         .await
         .is_err()
-    {
-        return HttpResponse::InternalServerError().finish();
-    }
-
-    if transaction.commit().await.is_err() {
-        return HttpResponse::InternalServerError().finish();
-    }
-
-    if send_confirmation_email(
-        &email_client,
-        new_subscriber,
-        &base_url.0,
-        &subscription_token,
-    )
-    .await
-    .is_err()
-    {
+        {
+            return HttpResponse::InternalServerError().finish();
+        }
+    } else {
         return HttpResponse::InternalServerError().finish();
     }
 
@@ -168,4 +196,42 @@ fn generate_subscription_token() -> String {
         .map(char::from)
         .take(25)
         .collect()
+}
+
+#[tracing::instrument(name = "Get subscription token from id", skip(pool, subscriber_id))]
+pub async fn get_subscription_token_from_id(
+    pool: &PgPool,
+    subscriber_id: &Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    let result = sqlx::query!(
+        "SELECT subscription_token FROM subscription_tokens \
+        WHERE subscriber_id = $1",
+        subscriber_id,
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to execute query: {:?}", e);
+        e
+    })?;
+    Ok(result.map(|r| r.subscription_token))
+}
+
+#[tracing::instrument(name = "Get subscriber id from email", skip(pool, subscriber))]
+pub async fn get_subscriber_id_from_email(
+    pool: &PgPool,
+    subscriber: &NewSubscriber,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let result = sqlx::query!(
+        "SELECT id FROM subscriptions \
+        WHERE email = $1",
+        subscriber.email.as_ref(),
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to execute query: {:?}", e);
+        e
+    })?;
+    Ok(result.map(|r| r.id))
 }
