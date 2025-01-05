@@ -1,5 +1,6 @@
 //! src/routes/subscriptions.rs
 
+use actix_web::http::StatusCode;
 use actix_web::{web, HttpResponse, ResponseError};
 use chrono::Utc;
 use sqlx::{Executor, PgPool, Postgres, Transaction};
@@ -9,22 +10,9 @@ use crate::domain::{NewSubscriber, SubscriberEmail, SubscriberName, Subscription
 use crate::email_client::EmailClient;
 use crate::startup::ApplicationBaseUrl;
 
-#[derive(serde::Deserialize)]
-#[allow(dead_code)]
-pub struct FormData {
-    email: String,
-    name: String,
-}
-
-impl TryFrom<FormData> for NewSubscriber {
-    type Error = String;
-
-    fn try_from(value: FormData) -> Result<Self, Self::Error> {
-        let name = SubscriberName::parse(value.name)?;
-        let email = SubscriberEmail::parse(value.email)?;
-        Ok(Self { email, name })
-    }
-}
+/////////////////////////////////
+// Error types
+/////////////////////////////////
 
 pub struct StoreTokenError(sqlx::Error);
 
@@ -50,7 +38,91 @@ impl std::error::Error for StoreTokenError {
     }
 }
 
-impl ResponseError for StoreTokenError {}
+#[derive(Debug)]
+pub enum GetTokenError {
+    DatabaseError(sqlx::Error),
+    ParseToken(String),
+}
+
+impl std::error::Error for GetTokenError {}
+
+impl std::fmt::Display for GetTokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "An error was encountered while \
+                trying to get a subscription token from a subscrscription ID."
+        )
+    }
+}
+
+impl From<sqlx::Error> for GetTokenError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::DatabaseError(e)
+    }
+}
+
+impl From<String> for GetTokenError {
+    fn from(e: String) -> Self {
+        Self::ParseToken(e)
+    }
+}
+
+#[derive(Debug)]
+pub enum SubscribeError {
+    ValidationError(String),
+    DatabaseError(sqlx::Error),
+    StoreTokenError(StoreTokenError),
+    SendEmailError(reqwest::Error),
+    GetTokenError(GetTokenError),
+}
+
+impl std::fmt::Display for SubscribeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Failed to create a new subscriber.")
+    }
+}
+
+impl std::error::Error for SubscribeError {}
+
+impl ResponseError for SubscribeError {
+    fn status_code(&self) -> actix_web::http::StatusCode {
+        match self {
+            SubscribeError::ValidationError(_) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+impl From<reqwest::Error> for SubscribeError {
+    fn from(e: reqwest::Error) -> Self {
+        Self::SendEmailError(e)
+    }
+}
+
+impl From<sqlx::Error> for SubscribeError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::DatabaseError(e)
+    }
+}
+
+impl From<StoreTokenError> for SubscribeError {
+    fn from(e: StoreTokenError) -> Self {
+        Self::StoreTokenError(e)
+    }
+}
+
+impl From<String> for SubscribeError {
+    fn from(e: String) -> Self {
+        Self::ValidationError(e)
+    }
+}
+
+impl From<GetTokenError> for SubscribeError {
+    fn from(e: GetTokenError) -> Self {
+        Self::GetTokenError(e)
+    }
+}
 
 fn error_chain_fmt(
     e: &impl std::error::Error,
@@ -65,6 +137,31 @@ fn error_chain_fmt(
     Ok(())
 }
 
+/////////////////////////////////
+// Data types
+/////////////////////////////////
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+pub struct FormData {
+    email: String,
+    name: String,
+}
+
+impl TryFrom<FormData> for NewSubscriber {
+    type Error = String;
+
+    fn try_from(value: FormData) -> Result<Self, Self::Error> {
+        let name = SubscriberName::parse(value.name)?;
+        let email = SubscriberEmail::parse(value.email)?;
+        Ok(Self { email, name })
+    }
+}
+
+/////////////////////////////////
+// Handler functions
+/////////////////////////////////
+
 #[tracing::instrument(
     name = "Adding a new subscriber",
     skip(form, pool, email_client, base_url),
@@ -78,68 +175,44 @@ pub async fn subscribe(
     pool: web::Data<PgPool>,
     email_client: web::Data<EmailClient>,
     base_url: web::Data<ApplicationBaseUrl>,
-) -> Result<HttpResponse, actix_web::Error> {
-    let new_subscriber = match form.0.try_into() {
-        Ok(new_subscriber) => new_subscriber,
-        Err(_) => return Ok(HttpResponse::BadRequest().finish()),
-    };
+) -> Result<HttpResponse, SubscribeError> {
+    let new_subscriber = form.0.try_into()?;
 
-    let mut subscriber_id = match get_subscriber_id_from_email(&pool, &new_subscriber).await {
-        Ok(subscriber_id) => subscriber_id,
-        Err(_) => return Ok(HttpResponse::InternalServerError().finish()),
-    };
+    let mut subscriber_id = get_subscriber_id_from_email(&pool, &new_subscriber).await?;
 
     let mut subscription_token = match subscriber_id {
-        Some(subscriber_id) => match get_subscription_token_from_id(&pool, &subscriber_id).await {
-            Ok(subscription_token) => subscription_token,
-            Err(_) => return Ok(HttpResponse::InternalServerError().finish()),
-        },
+        Some(subscriber_id) => get_subscription_token_from_id(&pool, &subscriber_id).await?,
         None => None,
     };
 
     if subscription_token.is_none() {
-        let mut transaction = match pool.begin().await {
-            Ok(transaction) => transaction,
-            Err(_) => return Ok(HttpResponse::InternalServerError().finish()),
-        };
+        let mut transaction = pool.begin().await?;
 
         if subscriber_id.is_none() {
-            let new_subscriber_id = match insert_subscriber(&new_subscriber, &mut transaction).await
-            {
-                Ok(new_subscriber_id) => new_subscriber_id,
-                Err(_) => return Ok(HttpResponse::InternalServerError().finish()),
-            };
+            let new_subscriber_id = insert_subscriber(&new_subscriber, &mut transaction).await?;
             subscriber_id = Some(new_subscriber_id);
         }
 
         let new_subscription_token = SubscriptionToken::generate();
-        if let Some(subscriber_id) = subscriber_id {
-            store_token(&mut transaction, subscriber_id, &new_subscription_token).await?;
-            subscription_token = Some(new_subscription_token);
-        } else {
-            return Ok(HttpResponse::InternalServerError().finish());
-        }
-
-        if transaction.commit().await.is_err() {
-            return Ok(HttpResponse::InternalServerError().finish());
-        }
-    }
-
-    if let Some(subscription_token) = subscription_token {
-        if send_confirmation_email(
-            &email_client,
-            new_subscriber,
-            &base_url.0,
-            &subscription_token,
+        store_token(
+            &mut transaction,
+            subscriber_id.unwrap(),
+            &new_subscription_token,
         )
-        .await
-        .is_err()
-        {
-            return Ok(HttpResponse::InternalServerError().finish());
-        }
-    } else {
-        return Ok(HttpResponse::InternalServerError().finish());
+        .await?;
+        subscription_token = Some(new_subscription_token);
+
+        transaction.commit().await?;
     }
+
+    // We must have a subscription token by this point.
+    send_confirmation_email(
+        &email_client,
+        new_subscriber,
+        &base_url.0,
+        &subscription_token.unwrap(),
+    )
+    .await?;
 
     Ok(HttpResponse::Ok().finish())
 }
@@ -227,7 +300,7 @@ pub async fn send_confirmation_email(
 pub async fn get_subscription_token_from_id(
     pool: &PgPool,
     subscriber_id: &Uuid,
-) -> Result<Option<SubscriptionToken>, String> {
+) -> Result<Option<SubscriptionToken>, GetTokenError> {
     let result = sqlx::query!(
         "SELECT subscription_token FROM subscription_tokens \
         WHERE subscriber_id = $1",
@@ -237,10 +310,10 @@ pub async fn get_subscription_token_from_id(
     .await
     .map_err(|e| {
         tracing::error!("Failed to execute query: {:?}", e);
-        e.to_string()
+        GetTokenError::DatabaseError(e)
     })?;
     result.map_or(Ok(None), |record| {
-        SubscriptionToken::parse(record.subscription_token).map(Some)
+        Ok(Some(SubscriptionToken::parse(record.subscription_token)?))
     })
 }
 
