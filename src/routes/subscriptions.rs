@@ -39,14 +39,14 @@ impl std::error::Error for StoreTokenError {
 }
 
 #[derive(Debug)]
-pub enum GetTokenError {
+pub enum GetExistingTokenError {
     DatabaseError(sqlx::Error),
     ParseToken(String),
 }
 
-impl std::error::Error for GetTokenError {}
+impl std::error::Error for GetExistingTokenError {}
 
-impl std::fmt::Display for GetTokenError {
+impl std::fmt::Display for GetExistingTokenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -56,34 +56,82 @@ impl std::fmt::Display for GetTokenError {
     }
 }
 
-impl From<sqlx::Error> for GetTokenError {
+impl From<sqlx::Error> for GetExistingTokenError {
     fn from(e: sqlx::Error) -> Self {
         Self::DatabaseError(e)
     }
 }
 
-impl From<String> for GetTokenError {
+impl From<String> for GetExistingTokenError {
     fn from(e: String) -> Self {
         Self::ParseToken(e)
     }
 }
 
-#[derive(Debug)]
 pub enum SubscribeError {
     ValidationError(String),
-    DatabaseError(sqlx::Error),
+    PoolError(sqlx::Error),
+    InsertSubscriberError(sqlx::Error),
+    TransactionCommitError(sqlx::Error),
+    GetExistingSubscriberError(sqlx::Error),
     StoreTokenError(StoreTokenError),
     SendEmailError(reqwest::Error),
-    GetTokenError(GetTokenError),
+    GetExistingTokenError(GetExistingTokenError),
+}
+
+impl std::fmt::Debug for SubscribeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        error_chain_fmt(self, f)
+    }
 }
 
 impl std::fmt::Display for SubscribeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Failed to create a new subscriber.")
+        match self {
+            SubscribeError::ValidationError(e) => write!(f, "{}", e),
+            SubscribeError::PoolError(_) => {
+                write!(f, "Failed to acquire a Postgres connection from the pool")
+            }
+            SubscribeError::InsertSubscriberError(_) => {
+                write!(f, "Failed to insert new subscriber in the database.")
+            }
+            SubscribeError::TransactionCommitError(_) => {
+                write!(
+                    f,
+                    "Failed to commit SQL transaction to store a new subscriber."
+                )
+            }
+            SubscribeError::StoreTokenError(_) => write!(
+                f,
+                "Failed to store the confirmation token for a new subscriber."
+            ),
+            SubscribeError::SendEmailError(_) => {
+                write!(f, "Failed to send a confirmation email.")
+            }
+            SubscribeError::GetExistingTokenError(_) => {
+                write!(f, "Failed to get an existing subscription token.")
+            }
+            SubscribeError::GetExistingSubscriberError(_) => {
+                write!(f, "Failed to get an existing subscriber.")
+            }
+        }
     }
 }
 
-impl std::error::Error for SubscribeError {}
+impl std::error::Error for SubscribeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SubscribeError::ValidationError(_) => None,
+            SubscribeError::PoolError(e) => Some(e),
+            SubscribeError::InsertSubscriberError(e) => Some(e),
+            SubscribeError::TransactionCommitError(e) => Some(e),
+            SubscribeError::StoreTokenError(e) => Some(e),
+            SubscribeError::SendEmailError(e) => Some(e),
+            SubscribeError::GetExistingTokenError(e) => Some(e),
+            SubscribeError::GetExistingSubscriberError(e) => Some(e),
+        }
+    }
+}
 
 impl ResponseError for SubscribeError {
     fn status_code(&self) -> actix_web::http::StatusCode {
@@ -100,12 +148,6 @@ impl From<reqwest::Error> for SubscribeError {
     }
 }
 
-impl From<sqlx::Error> for SubscribeError {
-    fn from(e: sqlx::Error) -> Self {
-        Self::DatabaseError(e)
-    }
-}
-
 impl From<StoreTokenError> for SubscribeError {
     fn from(e: StoreTokenError) -> Self {
         Self::StoreTokenError(e)
@@ -118,9 +160,9 @@ impl From<String> for SubscribeError {
     }
 }
 
-impl From<GetTokenError> for SubscribeError {
-    fn from(e: GetTokenError) -> Self {
-        Self::GetTokenError(e)
+impl From<GetExistingTokenError> for SubscribeError {
+    fn from(e: GetExistingTokenError) -> Self {
+        Self::GetExistingTokenError(e)
     }
 }
 
@@ -178,7 +220,9 @@ pub async fn subscribe(
 ) -> Result<HttpResponse, SubscribeError> {
     let new_subscriber = form.0.try_into()?;
 
-    let mut subscriber_id = get_subscriber_id_from_email(&pool, &new_subscriber).await?;
+    let mut subscriber_id = get_subscriber_id_from_email(&pool, &new_subscriber)
+        .await
+        .map_err(SubscribeError::GetExistingSubscriberError)?;
 
     let mut subscription_token = match subscriber_id {
         Some(subscriber_id) => get_subscription_token_from_id(&pool, &subscriber_id).await?,
@@ -186,10 +230,12 @@ pub async fn subscribe(
     };
 
     if subscription_token.is_none() {
-        let mut transaction = pool.begin().await?;
+        let mut transaction = pool.begin().await.map_err(SubscribeError::PoolError)?;
 
         if subscriber_id.is_none() {
-            let new_subscriber_id = insert_subscriber(&new_subscriber, &mut transaction).await?;
+            let new_subscriber_id = insert_subscriber(&new_subscriber, &mut transaction)
+                .await
+                .map_err(SubscribeError::InsertSubscriberError)?;
             subscriber_id = Some(new_subscriber_id);
         }
 
@@ -202,7 +248,10 @@ pub async fn subscribe(
         .await?;
         subscription_token = Some(new_subscription_token);
 
-        transaction.commit().await?;
+        transaction
+            .commit()
+            .await
+            .map_err(SubscribeError::TransactionCommitError)?;
     }
 
     // We must have a subscription token by this point.
@@ -300,7 +349,7 @@ pub async fn send_confirmation_email(
 pub async fn get_subscription_token_from_id(
     pool: &PgPool,
     subscriber_id: &Uuid,
-) -> Result<Option<SubscriptionToken>, GetTokenError> {
+) -> Result<Option<SubscriptionToken>, GetExistingTokenError> {
     let result = sqlx::query!(
         "SELECT subscription_token FROM subscription_tokens \
         WHERE subscriber_id = $1",
@@ -310,7 +359,7 @@ pub async fn get_subscription_token_from_id(
     .await
     .map_err(|e| {
         tracing::error!("Failed to execute query: {:?}", e);
-        GetTokenError::DatabaseError(e)
+        GetExistingTokenError::DatabaseError(e)
     })?;
     result.map_or(Ok(None), |record| {
         Ok(Some(SubscriptionToken::parse(record.subscription_token)?))
