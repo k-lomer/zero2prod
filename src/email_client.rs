@@ -3,6 +3,34 @@
 use crate::domain::SubscriberEmail;
 use reqwest::Client;
 use secrecy::{ExposeSecret, Secret};
+use url::ParseError;
+
+#[derive(thiserror::Error)]
+pub enum SendEmailError {
+    #[error("Failed to send the confirmation email request.")]
+    RequestFailedError(#[from] reqwest::Error),
+    #[error("Failed to parse the email client URL")]
+    ClientUrlParseError(#[from] ParseError),
+}
+
+impl std::fmt::Debug for SendEmailError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        error_chain_fmt(self, f)
+    }
+}
+
+fn error_chain_fmt(
+    e: &impl std::error::Error,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    writeln!(f, "{}\n", e)?;
+    let mut current = e.source();
+    while let Some(cause) = current {
+        writeln!(f, "Caused by:\n\t{}", cause)?;
+        current = cause.source();
+    }
+    Ok(())
+}
 
 pub struct EmailClient {
     http_client: Client,
@@ -32,7 +60,7 @@ impl EmailClient {
         subject: &str,
         html_content: &str,
         text_content: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), SendEmailError> {
         let url = self.build_url()?;
         let request_body = SendEmailRequest {
             from: self.sender.as_ref(),
@@ -51,19 +79,14 @@ impl EmailClient {
             )
             .json(&request_body)
             .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .error_for_status()
-            .map_err(|e| e.to_string())?;
+            .await?
+            .error_for_status()?;
 
         Ok(())
     }
 
-    pub fn build_url(&self) -> Result<reqwest::Url, String> {
-        reqwest::Url::parse(&self.base_url)
-            .map_err(|e| e.to_string())?
-            .join("email")
-            .map_err(|e| e.to_string())
+    pub fn build_url(&self) -> Result<reqwest::Url, ParseError> {
+        reqwest::Url::parse(&self.base_url)?.join("email")
     }
 }
 

@@ -2,12 +2,13 @@
 
 use actix_web::http::StatusCode;
 use actix_web::{web, HttpResponse, ResponseError};
+use anyhow::Context;
 use chrono::Utc;
 use sqlx::{Executor, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::domain::{NewSubscriber, SubscriberEmail, SubscriberName, SubscriptionToken};
-use crate::email_client::EmailClient;
+use crate::email_client::{EmailClient, SendEmailError};
 use crate::startup::ApplicationBaseUrl;
 
 /////////////////////////////////
@@ -68,15 +69,12 @@ impl From<String> for GetExistingTokenError {
     }
 }
 
+#[derive(thiserror::Error)]
 pub enum SubscribeError {
+    #[error("{0}")]
     ValidationError(String),
-    PoolError(sqlx::Error),
-    InsertSubscriberError(sqlx::Error),
-    TransactionCommitError(sqlx::Error),
-    GetExistingSubscriberError(sqlx::Error),
-    StoreTokenError(StoreTokenError),
-    SendEmailError(reqwest::Error),
-    GetExistingTokenError(GetExistingTokenError),
+    #[error(transparent)]
+    UnexpectedError(#[from] anyhow::Error),
 }
 
 impl std::fmt::Debug for SubscribeError {
@@ -85,84 +83,12 @@ impl std::fmt::Debug for SubscribeError {
     }
 }
 
-impl std::fmt::Display for SubscribeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SubscribeError::ValidationError(e) => write!(f, "{}", e),
-            SubscribeError::PoolError(_) => {
-                write!(f, "Failed to acquire a Postgres connection from the pool")
-            }
-            SubscribeError::InsertSubscriberError(_) => {
-                write!(f, "Failed to insert new subscriber in the database.")
-            }
-            SubscribeError::TransactionCommitError(_) => {
-                write!(
-                    f,
-                    "Failed to commit SQL transaction to store a new subscriber."
-                )
-            }
-            SubscribeError::StoreTokenError(_) => write!(
-                f,
-                "Failed to store the confirmation token for a new subscriber."
-            ),
-            SubscribeError::SendEmailError(_) => {
-                write!(f, "Failed to send a confirmation email.")
-            }
-            SubscribeError::GetExistingTokenError(_) => {
-                write!(f, "Failed to get an existing subscription token.")
-            }
-            SubscribeError::GetExistingSubscriberError(_) => {
-                write!(f, "Failed to get an existing subscriber.")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SubscribeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            SubscribeError::ValidationError(_) => None,
-            SubscribeError::PoolError(e) => Some(e),
-            SubscribeError::InsertSubscriberError(e) => Some(e),
-            SubscribeError::TransactionCommitError(e) => Some(e),
-            SubscribeError::StoreTokenError(e) => Some(e),
-            SubscribeError::SendEmailError(e) => Some(e),
-            SubscribeError::GetExistingTokenError(e) => Some(e),
-            SubscribeError::GetExistingSubscriberError(e) => Some(e),
-        }
-    }
-}
-
 impl ResponseError for SubscribeError {
     fn status_code(&self) -> actix_web::http::StatusCode {
         match self {
             SubscribeError::ValidationError(_) => StatusCode::BAD_REQUEST,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
+            SubscribeError::UnexpectedError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
-    }
-}
-
-impl From<reqwest::Error> for SubscribeError {
-    fn from(e: reqwest::Error) -> Self {
-        Self::SendEmailError(e)
-    }
-}
-
-impl From<StoreTokenError> for SubscribeError {
-    fn from(e: StoreTokenError) -> Self {
-        Self::StoreTokenError(e)
-    }
-}
-
-impl From<String> for SubscribeError {
-    fn from(e: String) -> Self {
-        Self::ValidationError(e)
-    }
-}
-
-impl From<GetExistingTokenError> for SubscribeError {
-    fn from(e: GetExistingTokenError) -> Self {
-        Self::GetExistingTokenError(e)
     }
 }
 
@@ -218,24 +144,27 @@ pub async fn subscribe(
     email_client: web::Data<EmailClient>,
     base_url: web::Data<ApplicationBaseUrl>,
 ) -> Result<HttpResponse, SubscribeError> {
-    let new_subscriber = form.0.try_into()?;
+    let new_subscriber = form.0.try_into().map_err(SubscribeError::ValidationError)?;
 
     let mut subscriber_id = get_subscriber_id_from_email(&pool, &new_subscriber)
         .await
-        .map_err(SubscribeError::GetExistingSubscriberError)?;
-
+        .context("Failed to get a subscriber ID from the email address if one exists.")?;
     let mut subscription_token = match subscriber_id {
-        Some(subscriber_id) => get_subscription_token_from_id(&pool, &subscriber_id).await?,
+        Some(subscriber_id) => get_subscription_token_from_id(&pool, &subscriber_id)
+            .await
+            .context("Failed to get a subscription token from the subscriber ID if one exists.")?,
         None => None,
     };
 
     if subscription_token.is_none() {
-        let mut transaction = pool.begin().await.map_err(SubscribeError::PoolError)?;
-
+        let mut transaction = pool
+            .begin()
+            .await
+            .context("Failed to acquire a Postgres connection from the pool")?;
         if subscriber_id.is_none() {
             let new_subscriber_id = insert_subscriber(&new_subscriber, &mut transaction)
                 .await
-                .map_err(SubscribeError::InsertSubscriberError)?;
+                .context("Failed to insert new subscriber in the database.")?;
             subscriber_id = Some(new_subscriber_id);
         }
 
@@ -245,13 +174,14 @@ pub async fn subscribe(
             subscriber_id.unwrap(),
             &new_subscription_token,
         )
-        .await?;
+        .await
+        .context("Failed to store the confirmation token for a new subscriber.")?;
         subscription_token = Some(new_subscription_token);
 
         transaction
             .commit()
             .await
-            .map_err(SubscribeError::TransactionCommitError)?;
+            .context("Failed to commit SQL transaction to store a new subscriber.")?;
     }
 
     // We must have a subscription token by this point.
@@ -261,8 +191,8 @@ pub async fn subscribe(
         &base_url.0,
         &subscription_token.unwrap(),
     )
-    .await?;
-
+    .await
+    .context("Failed to send a confirmation email.")?;
     Ok(HttpResponse::Ok().finish())
 }
 
@@ -285,10 +215,7 @@ pub async fn insert_subscriber(
         new_subscriber.name.as_ref(),
         Utc::now()
     );
-    transaction.execute(query).await.map_err(|e| {
-        tracing::error!("Failed to execute query: {:?}", e);
-        e
-    })?;
+    transaction.execute(query).await?;
     Ok(subscriber_id)
 }
 
@@ -309,10 +236,7 @@ pub async fn store_token(
         subscription_token.as_ref(),
         subscriber_id
     );
-    transaction.execute(query).await.map_err(|e| {
-        tracing::error!("Failed to execute query: {:?}", e);
-        StoreTokenError(e)
-    })?;
+    transaction.execute(query).await.map_err(StoreTokenError)?;
     Ok(())
 }
 
@@ -325,7 +249,7 @@ pub async fn send_confirmation_email(
     new_subscriber: NewSubscriber,
     base_url: &str,
     subscription_token: &SubscriptionToken,
-) -> Result<(), String> {
+) -> Result<(), SendEmailError> {
     let confirmation_link = format!(
         "{}/subscriptions/confirm?subscription_token={}",
         base_url,
@@ -357,10 +281,7 @@ pub async fn get_subscription_token_from_id(
     )
     .fetch_optional(pool)
     .await
-    .map_err(|e| {
-        tracing::error!("Failed to execute query: {:?}", e);
-        GetExistingTokenError::DatabaseError(e)
-    })?;
+    .map_err(|e| GetExistingTokenError::DatabaseError(e))?;
     result.map_or(Ok(None), |record| {
         Ok(Some(SubscriptionToken::parse(record.subscription_token)?))
     })
@@ -377,10 +298,6 @@ pub async fn get_subscriber_id_from_email(
         subscriber.email.as_ref(),
     )
     .fetch_optional(pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to execute query: {:?}", e);
-        e
-    })?;
+    .await?;
     Ok(result.map(|r| r.id))
 }
