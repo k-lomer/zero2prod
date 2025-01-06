@@ -269,7 +269,7 @@ pub async fn get_subscription_token_from_id(
     )
     .fetch_optional(pool)
     .await
-    .map_err(|e| GetExistingTokenError::DatabaseError(e))?;
+    .map_err(GetExistingTokenError::DatabaseError)?;
     result.map_or(Ok(None), |record| {
         Ok(Some(SubscriptionToken::parse(record.subscription_token)?))
     })
