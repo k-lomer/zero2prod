@@ -5,7 +5,7 @@ use anyhow::Context;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::domain::SubscriptionToken;
+use crate::{domain::SubscriptionToken, error::error_chain_fmt};
 
 #[derive(thiserror::Error)]
 pub enum ConfirmationError {
@@ -31,19 +31,6 @@ impl ResponseError for ConfirmationError {
             ConfirmationError::UnexpectedError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
-}
-
-fn error_chain_fmt(
-    e: &impl std::error::Error,
-    f: &mut std::fmt::Formatter<'_>,
-) -> std::fmt::Result {
-    writeln!(f, "{}\n", e)?;
-    let mut current = e.source();
-    while let Some(cause) = current {
-        writeln!(f, "Caused by:\n\t{}", cause)?;
-        current = cause.source();
-    }
-    Ok(())
 }
 
 #[derive(serde::Deserialize)]
