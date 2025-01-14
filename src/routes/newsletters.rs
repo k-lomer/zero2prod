@@ -188,7 +188,7 @@ async fn validate_credentials(
         verify_password_hash(expected_password_hash, credentials.password)
     })
     .await
-    .context("Invalid password.")
+    .context("Failed to spawn blocking task.")
     .map_err(PublishError::AuthError)??;
 
     user_id.ok_or_else(|| PublishError::AuthError(anyhow::anyhow!("Unknown username.")))
