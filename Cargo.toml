@@ -16,6 +16,7 @@ argon2 = { version = "0.5", features = ["std"] }
 base64 = "0.22"
 chrono = { version = "0.4.22", default-features = false, features = ["clock"] }
 config = "0.14"
+htmlescape = "0.3"
 rand = { version = "0.8", features = ["std_rng"] }
 secrecy = { version = "0.8", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
