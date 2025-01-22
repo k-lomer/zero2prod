@@ -5,7 +5,7 @@ use anyhow::Context;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{domain::SubscriptionToken, error::error_chain_fmt};
+use crate::{domain::SubscriptionToken, utils::error_chain_fmt};
 
 #[derive(thiserror::Error)]
 pub enum ConfirmationError {

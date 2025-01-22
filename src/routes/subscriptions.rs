@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use crate::domain::{NewSubscriber, SubscriberEmail, SubscriberName, SubscriptionToken};
 use crate::email_client::{EmailClient, SendEmailError};
-use crate::error::error_chain_fmt;
 use crate::startup::ApplicationBaseUrl;
+use crate::utils::error_chain_fmt;
 
 /////////////////////////////////
 // Error types

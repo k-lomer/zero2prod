@@ -1,7 +1,7 @@
 //! src/email_client.rs
 
 use crate::domain::SubscriberEmail;
-use crate::error::error_chain_fmt;
+use crate::utils::error_chain_fmt;
 use reqwest::Client;
 use secrecy::{ExposeSecret, Secret};
 use url::ParseError;
