@@ -17,7 +17,7 @@ pub async fn login_form(flash_messages: IncomingFlashMessages) -> HttpResponse {
             r#"<!DOCTYPE html>
 <html lang="en">
 
-<head>S
+<head>
     <meta http-equiv="content-type" content="text/html; charset=utf-8">
     <title>Login</title>
 </head>
